@@ -18,8 +18,9 @@ use crate::{
     location::{DstLocation, SrcLocation},
     message_filter::MessageFilter,
     messages::{
-        BootstrapResponse, Envelope, InfrastructureQuery, JoinRequest, Message, MessageHash,
-        MessageKind, MessageStatus, PlainMessage, ResourceProofResponse, Variant, VerifyStatus,
+        BootstrapResponse, Envelope, GetSectionResponse, InfrastructureQuery, JoinRequest, Message,
+        MessageHash, MessageKind, MessageStatus, PlainMessage, ResourceProofResponse, Variant,
+        VerifyStatus,
     },
     network::Network,
     node::Node,
@@ -172,7 +173,7 @@ impl Approved {
                 debug!("Received GetSectionRequest({}) from {}", name, sender);
 
                 let response = if self.section.prefix().matches(&name) {
-                    InfrastructureQuery::GetSectionSuccess {
+                    GetSectionResponse::Success {
                         prefix: self.section.elders_info().prefix,
                         key: *self.section.chain().last_key(),
                         elders: self
@@ -184,10 +185,11 @@ impl Approved {
                     }
                 } else if let Some(section) = self.network.closest(&name) {
                     let addrs = section.peers().map(Peer::addr).copied().collect();
-                    InfrastructureQuery::GetSectionRedirect(addrs)
+                    GetSectionResponse::Redirect(addrs)
                 } else {
                     return Err(Error::InvalidDstLocation);
                 };
+                let response = InfrastructureQuery::GetSectionResponse(response);
                 let response = bincode::serialize(&response)?.into();
 
                 debug!("Sending {:?} to {}", response, sender);
@@ -198,8 +200,7 @@ impl Approved {
                     message: response,
                 }])
             }
-            InfrastructureQuery::GetSectionSuccess { .. }
-            | InfrastructureQuery::GetSectionRedirect(_) => {
+            InfrastructureQuery::GetSectionResponse(_) => {
                 if let Some(RelocateState::InProgress(tx)) = &mut self.relocate_state {
                     trace!("Forwarding {:?} to the bootstrap task", message);
                     let _ = tx.send((Envelope::Infrastructure(message), sender)).await;
@@ -505,7 +506,6 @@ impl Approved {
             }
             Variant::Sync { .. }
             | Variant::Relocate(_)
-            | Variant::BootstrapRequest(_)
             | Variant::BouncedUntrustedMessage(_)
             | Variant::BouncedUnknownMessage { .. }
             | Variant::DKGMessage { .. }
@@ -543,14 +543,6 @@ impl Approved {
             Variant::RelocatePromise(promise) => {
                 self.handle_relocate_promise(*promise, msg.to_bytes())
             }
-            Variant::BootstrapRequest(name) => {
-                let sender = sender.ok_or(Error::InvalidSrcLocation)?;
-                Ok(vec![self.handle_bootstrap_request(
-                    msg.src().to_node_peer(sender)?,
-                    *name,
-                )?])
-            }
-
             Variant::JoinRequest(join_request) => {
                 let sender = sender.ok_or(Error::InvalidSrcLocation)?;
                 self.handle_join_request(msg.src().to_node_peer(sender)?, *join_request.clone())
@@ -978,31 +970,6 @@ impl Approved {
         }
 
         Ok(commands)
-    }
-
-    // Note: As an adult, we should only give info about our section elders and they would
-    // further guide the joining node. However this lead to a loop if the Adult is the new Elder so
-    // we use the same code as for Elder and return Join in some cases.
-    fn handle_bootstrap_request(&self, peer: Peer, destination: XorName) -> Result<Command> {
-        debug!(
-            "Received BootstrapRequest to section at {} from {:?}.",
-            destination, peer
-        );
-
-        let response = if self.section.prefix().matches(&destination) {
-            BootstrapResponse::Join {
-                elders_info: self.section.elders_info().clone(),
-                section_key: *self.section.chain().last_key(),
-            }
-        } else if let Some(section) = self.network.closest(&destination) {
-            let conn_infos = section.peers().map(Peer::addr).copied().collect();
-            BootstrapResponse::Rebootstrap(conn_infos)
-        } else {
-            return Err(Error::InvalidDstLocation);
-        };
-
-        debug!("Sending BootstrapResponse {:?} to {}", response, peer);
-        self.send_direct_message(peer.addr(), Variant::BootstrapResponse(response))
     }
 
     fn handle_join_request(
